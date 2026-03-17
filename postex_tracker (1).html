@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>PostEx Tracker · Dairaa</title>
+<script src='https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js'></script>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { background: #161614; min-height: 100vh; }
+  body { font-family: 'Courier New', monospace; color: #e8e2d5; }
+  input, button { font-family: 'Courier New', monospace; }
+  .search-input { width: 100%; padding: 10px 14px; background: #1e1e1b; border: 0.5px solid #333; border-radius: 6px; color: #e8e2d5; font-size: 13px; outline: none; letter-spacing: 0.03em; transition: border-color 0.2s; }
+  .search-input::placeholder { color: #444; }
+  .search-input:focus { border-color: #c0392b; }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.35} }
+  .pulsing { animation: pulse 1.2s ease-in-out infinite; }
+  ::-webkit-scrollbar { width: 4px; }
+  ::-webkit-scrollbar-track { background: #161614; }
+  ::-webkit-scrollbar-thumb { background: #2a2a26; border-radius: 2px; }
+  #root { max-width: 860px; margin: 0 auto; padding: 2rem 1.25rem 3rem; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script>
+const STORAGE_KEY = "postex_tracker_v3";
+
+// ── OCR via Tesseract.js (free, runs in browser) ──────────────────────────────
+async function extractSlip(file) {
+  const url = URL.createObjectURL(file);
+  const result = await Tesseract.recognize(url, 'eng', { logger: () => {} });
+  URL.revokeObjectURL(url);
+  const text = result.data.text;
+  console.log("OCR TEXT:", text);
+
+  const tidMatch = text.match(/0\d{4}-\d{2}-\d{9}/);
+  const trackingId = tidMatch ? tidMatch[0] : "";
+
+  const nameMatch = text.match(/(?:To\s*\(?Consignee\)?[:\-]?\s*)([A-Za-z][A-Za-z\s]{2,30}?)(?=\s*\d|\n)/i);
+  const name = nameMatch ? nameMatch[1].trim() : "";
+
+  const phoneMatch = text.match(/0[3][0-9]{9}/);
+  const phone = phoneMatch ? phoneMatch[0] : "";
+
+  const addrMatch = text.match(/Address\s*[:\-]?\s*(.+?)(?=From\s*\(Shipper\)|$)/is);
+  const address = addrMatch ? addrMatch[1].replace(/\s*\n\s*/g, ", ").replace(/,\s*,/g, ",").trim() : "";
+
+  const codMatch = text.match(/COD[:\s]+(\d+)/i);
+  const cod = codMatch ? parseInt(codMatch[1]) : 0;
+
+  const payMatch = text.match(/Payable\s+Amount[:\s]+(\d+)/i);
+  const payable = payMatch ? parseInt(payMatch[1]) : 0;
+
+  return { trackingId, name, phone, address, cod, payable };
+}
+
+// ── Tracking: scrape PostEx directly via free CORS proxies ───────────────────
+async function fetchStatus(trackingId) {
+  const targetUrl = `https://www.postex.pk/tracking-detail?tracking_number=${encodeURIComponent(trackingId)}`;
+  const proxies = [
+    `https://api.allorigins.win/get?url=${encodeURIComponent(targetUrl)}`,
+    `https://corsproxy.io/?${encodeURIComponent(targetUrl)}`
+  ];
+
+  let html = "";
+  for (const proxy of proxies) {
+    try {
+      const res = await fetch(proxy, { signal: AbortSignal.timeout(15000) });
+      if (!res.ok) continue;
+      if (proxy.includes("allorigins")) {
+        const json = await res.json();
+        html = json.contents || "";
+      } else {
+        html = await res.text();
+      }
+      if (html.length > 200) break;
+    } catch(e) { console.warn("Proxy failed:", proxy, e); }
+  }
+
+  if (!html) return { status: "Could not reach PostEx", lastUpdate: "", delivered: false };
+
+  const doc = new DOMParser().parseFromString(html, "text/html");
+
+  // Pull text from status/tracking related elements
+  const selectors = ['[class*="status"]','[class*="track"]','[class*="timeline"]','[class*="step"]','[class*="history"]','li','td','p'];
+  let statusText = "";
+  for (const sel of selectors) {
+    for (const el of doc.querySelectorAll(sel)) {
+      const t = el.textContent.trim().replace(/\s+/g, " ");
+      if (t.length > 3 && t.length < 100 && /delivered|in transit|dispatch|pickup|picked|return|out for delivery/i.test(t)) {
+        statusText = t;
+        break;
+      }
+    }
+    if (statusText) break;
+  }
+
+  // Fallback raw regex
+  if (!statusText) {
+    const rawText = doc.body ? doc.body.innerText || doc.body.textContent : html.replace(/<[^>]+>/g, " ");
+    const match = rawText.match(/(delivered|out for delivery|in transit|dispatched|picked up|return initiated|returned)[^\n]{0,60}/i);
+    if (match) statusText = match[0].trim();
+  }
+
+  const lower = html.toLowerCase();
+  if (!statusText) {
+    if (lower.includes("not found") || lower.includes("invalid tracking")) return { status: "Tracking ID not found", lastUpdate: "", delivered: false };
+    return { status: "No status found — check postex.pk", lastUpdate: "", delivered: false };
+  }
+
+  const dateMatch = html.match(/(\d{4}-\d{2}-\d{2}[T\s]\d{2}:\d{2})|(\d{2}[\/\-]\d{2}[\/\-]\d{4})/);
+  const lastUpdate = dateMatch ? dateMatch[0].trim() : "";
+  const delivered = /delivered/i.test(statusText) && !/return/i.test(statusText);
+
+  return { status: statusText.slice(0, 80), lastUpdate, delivered };
+}
+
+// ── Styling helpers ───────────────────────────────────────────────────────────
+function statusStyle(s) {
+  const l = (s || "").toLowerCase();
+  if (l.includes("deliver") && !l.includes("return")) return { bg:"#0d2b1f", color:"#4ade80", border:"#166534" };
+  if (l.includes("out for")) return { bg:"#2b1f0a", color:"#f59e0b", border:"#92400e" };
+  if (l.includes("transit") || l.includes("dispatch") || l.includes("picked")) return { bg:"#0d1b2b", color:"#60a5fa", border:"#1e40af" };
+  if (l.includes("return")) return { bg:"#2b0d0d", color:"#f87171", border:"#991b1b" };
+  if (l.includes("tracking") || l.includes("reading")) return { bg:"#1a1a14", color:"#c9a84c", border:"#92400e" };
+  return { bg:"#1e1e1b", color:"#555", border:"#2a2a26" };
+}
+
+function metricCard(label, value, accent) {
+  return `<div style="background:#1a1a17;border:0.5px solid ${accent}33;border-top:2px solid ${accent};border-radius:6px;padding:14px 16px;flex:1;min-width:120px;">
+    <p style="font-size:9px;letter-spacing:0.15em;color:#555;margin-bottom:10px;text-transform:uppercase;">${label}</p>
+    <p style="font-size:17px;font-weight:700;color:#c9a84c;">${value}</p>
+  </div>`;
+}
+
+function slipCard(slip, loading) {
+  const ss = statusStyle(loading ? "tracking" : slip.status);
+  return `<div style="background:#1a1a17;border:0.5px solid #2a2a26;border-left:2px solid #c0392b;border-radius:6px;padding:1rem 1.25rem;margin-bottom:10px;">
+    <div style="display:flex;justify-content:space-between;gap:16px;flex-wrap:wrap;">
+      <div style="flex:1;min-width:0;">
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px;flex-wrap:wrap;">
+          <span style="font-size:11px;letter-spacing:0.06em;color:#555;">${slip.trackingId}</span>
+          <span class="${loading?'pulsing':''}" style="font-size:10px;letter-spacing:0.08em;padding:2px 9px;border-radius:3px;font-weight:600;text-transform:uppercase;background:${ss.bg};color:${ss.color};border:0.5px solid ${ss.border};">
+            ${loading ? "Tracking…" : slip.status}
+          </span>
+          ${!loading && slip.lastUpdate ? `<span style="font-size:10px;color:#444;">${slip.lastUpdate}</span>` : ""}
+        </div>
+        <p style="font-size:15px;font-weight:700;color:#c9a84c;letter-spacing:0.04em;margin-bottom:5px;">${slip.name || "—"}</p>
+        <p style="font-size:12px;color:#777;letter-spacing:0.06em;margin-bottom:6px;">${slip.phone || "—"}</p>
+        <p style="font-size:12px;color:#555;line-height:1.65;">${slip.address || "—"}</p>
+      </div>
+      <div style="text-align:right;min-width:100px;flex-shrink:0;">
+        <p style="font-size:9px;letter-spacing:0.12em;color:#444;text-transform:uppercase;margin-bottom:4px;">COD</p>
+        <p style="font-size:18px;font-weight:700;color:#e8e2d5;">Rs ${Number(slip.cod).toLocaleString()}</p>
+        <div style="margin-top:14px;">
+          <p style="font-size:9px;letter-spacing:0.12em;color:#444;text-transform:uppercase;margin-bottom:4px;">Shipping</p>
+          <p style="font-size:13px;color:#777;">Rs ${Number(slip.payable).toLocaleString()}</p>
+        </div>
+      </div>
+    </div>
+    <div style="display:flex;align-items:center;gap:8px;border-top:0.5px solid #222;padding-top:10px;margin-top:12px;flex-wrap:wrap;">
+      <button onclick="refreshOne('${slip.id}')" ${loading?"disabled":""} style="padding:5px 14px;border-radius:4px;border:0.5px solid #c0392b55;background:transparent;color:${loading?'#444':'#c0392b'};font-size:11px;cursor:${loading?'default':'pointer'};letter-spacing:0.08em;font-family:'Courier New',monospace;">
+        ${loading ? "CHECKING…" : "↻ REFRESH"}
+      </button>
+      <button onclick="removeSlip('${slip.id}')" style="padding:5px 14px;border-radius:4px;border:0.5px solid #2a2a26;background:transparent;color:#444;font-size:11px;cursor:pointer;letter-spacing:0.08em;font-family:'Courier New',monospace;">REMOVE</button>
+      <span style="margin-left:auto;font-size:10px;color:#2e2e2a;">${slip.addedAt}</span>
+    </div>
+  </div>`;
+}
+
+// ── State & Render ────────────────────────────────────────────────────────────
+let slips = (function(){ try { return JSON.parse(localStorage.getItem(STORAGE_KEY)||"[]"); } catch { return []; } })();
+let tracking = {};
+let query = "";
+
+function save() { localStorage.setItem(STORAGE_KEY, JSON.stringify(slips)); }
+
+function render() {
+  const q = query.toLowerCase();
+  const filtered = slips.filter(s => !q || (s.name||"").toLowerCase().includes(q) || (s.phone||"").includes(q) || (s.trackingId||"").toLowerCase().includes(q));
+  const delivered = slips.filter(s => s.delivered);
+  const totalCOD = slips.reduce((a,s) => a + (Number(s.cod)||0), 0);
+  const delCOD = delivered.reduce((a,s) => a + (Number(s.cod)||0), 0);
+  const shipping = slips.reduce((a,s) => a + (Number(s.payable)||0), 0);
+
+  document.getElementById("root").innerHTML = `
+    <div style="width:2px;background:#c0392b;position:fixed;left:0;top:0;height:100vh;"></div>
+    <div style="margin-bottom:2rem;">
+      <p style="font-size:10px;letter-spacing:0.2em;color:#c0392b;text-transform:uppercase;margin-bottom:8px;">Dairaa Official · PostEx</p>
+      <h1 style="font-size:26px;font-weight:700;color:#c9a84c;letter-spacing:0.06em;text-transform:uppercase;line-height:1.1;margin-bottom:6px;">Shipment Tracker</h1>
+      <p style="font-size:10px;color:#444;letter-spacing:0.15em;">SCAN · TRACK · MANAGE · 100% FREE</p>
+    </div>
+    <div style="display:flex;gap:10px;margin-bottom:1.75rem;flex-wrap:wrap;">
+      ${metricCard("Total Parcels", slips.length, "#c9a84c")}
+      ${metricCard("Delivered", delivered.length, "#4ade80")}
+      ${metricCard("Delivered COD", "Rs "+delCOD.toLocaleString(), "#60a5fa")}
+      ${metricCard("Overall COD", "Rs "+totalCOD.toLocaleString(), "#c9a84c")}
+      ${metricCard("Shipping", "Rs "+shipping.toLocaleString(), "#c0392b")}
+    </div>
+    <div style="display:flex;gap:10px;margin-bottom:1.25rem;align-items:center;">
+      <input class="search-input" id="searchBox" value="${query.replace(/"/g,'&quot;')}" placeholder="Search by name, phone, or tracking ID…" oninput="onSearch(this.value)" />
+      <button id="addBtn" onclick="document.getElementById('fileInput').click()"
+        style="padding:10px 20px;border-radius:4px;border:none;background:#c0392b;color:#fff;font-size:11px;font-weight:700;cursor:pointer;letter-spacing:0.1em;white-space:nowrap;text-transform:uppercase;font-family:'Courier New',monospace;">
+        + ADD SLIP
+      </button>
+      <input type="file" id="fileInput" accept="image/*" style="display:none;" onchange="handleFile(this)" />
+    </div>
+    ${slips.length === 0 ? `
+      <div onclick="document.getElementById('fileInput').click()" style="border:1px dashed #2a2a26;border-radius:6px;padding:5rem 2rem;text-align:center;cursor:pointer;">
+        <p style="font-size:13px;color:#555;letter-spacing:0.12em;text-transform:uppercase;margin-bottom:8px;">Drop a PostEx slip here</p>
+        <p style="font-size:11px;color:#333;letter-spacing:0.06em;">click to upload · reads & tracks automatically · no API key needed</p>
+      </div>
+    ` : filtered.length === 0 ? `
+      <p style="text-align:center;color:#333;padding:3rem 0;font-size:11px;letter-spacing:0.12em;">NO SLIPS MATCH YOUR SEARCH.</p>
+    ` : filtered.map(s => slipCard(s, !!tracking[s.id])).join("")}
+    <p style="text-align:center;font-size:10px;color:#222;letter-spacing:0.15em;margin-top:3rem;text-transform:uppercase;">Dairaa Official · Shipment Tracker</p>
+  `;
+}
+
+function onSearch(val) {
+  query = val;
+  render();
+  const el = document.getElementById("searchBox");
+  if (el) { el.focus(); el.setSelectionRange(val.length, val.length); }
+}
+
+async function handleFile(input) {
+  const file = input.files[0]; input.value = "";
+  if (!file) return;
+  const btn = document.getElementById("addBtn");
+  btn.textContent = "READING…"; btn.disabled = true; btn.style.background = "#2a2a26"; btn.style.color = "#555";
+  try {
+    const data = await extractSlip(file);
+    if (!data.trackingId) throw new Error("Tracking ID not found — make sure the image is clear and shows the full slip");
+    const id = String(Date.now());
+    slips = [{ ...data, id, status: "Tracking…", lastUpdate: "", delivered: false, addedAt: new Date().toLocaleDateString("en-PK") }, ...slips];
+    save();
+    tracking[id] = true;
+    render();
+    btn.textContent = "+ ADD SLIP"; btn.disabled = false; btn.style.background = "#c0392b"; btn.style.color = "#fff";
+    const result = await fetchStatus(data.trackingId);
+    slips = slips.map(s => s.id === id ? { ...s, ...result } : s);
+    save(); delete tracking[id]; render();
+  } catch(e) {
+    alert("Error: " + e.message);
+    btn.textContent = "+ ADD SLIP"; btn.disabled = false; btn.style.background = "#c0392b"; btn.style.color = "#fff";
+  }
+}
+
+async function refreshOne(id) {
+  const slip = slips.find(s => s.id === id); if (!slip) return;
+  slips = slips.map(s => s.id === id ? { ...s, status: "Tracking…" } : s);
+  tracking[id] = true; render();
+  const result = await fetchStatus(slip.trackingId);
+  slips = slips.map(s => s.id === id ? { ...s, ...result } : s);
+  save(); delete tracking[id]; render();
+}
+
+function removeSlip(id) {
+  slips = slips.filter(s => s.id !== id); save(); render();
+}
+
+render();
+</script>
+</body>
+</html>
